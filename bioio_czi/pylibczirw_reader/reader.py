@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import logging
-from typing import Any, Callable, ContextManager, Dict, Optional, Tuple, Union
+from typing import Any, Callable, ContextManager, Dict, Optional, Tuple, Union, List
 from xml.etree import ElementTree as ET
 
 import dask.array as da
@@ -97,6 +97,7 @@ class Reader(BaseReader):
             )
 
     def __init__(self, image: types.PathLike, fs_kwargs: Dict[str, Any] = {}) -> None:
+        super().__init__(image, **fs_kwargs)
         path = str(image)
         try:
             with open(path) as file:
@@ -107,6 +108,11 @@ class Reader(BaseReader):
                 self._scenes_bounding_rectangle = (
                     file.scenes_bounding_rectangle_no_pyramid
                 )
+###############################################################################
+            self._current_zoom = 1.0  # newly added
+            self._resolution_cache = None  # 缓存 zoom 信息
+
+###############################################################################
         except RuntimeError:
             raise exceptions.UnsupportedFileFormatError(self.__class__.__name__, path)
 
@@ -243,96 +249,21 @@ class Reader(BaseReader):
                 scene = self._current_scene_index
                 roi = self._scenes_bounding_rectangle[scene]
             with open(self._path) as file:
-                result = file.read(scene=scene, plane=plane, roi=roi)
+                #result = file.read(scene=scene, plane=plane, roi=roi)
+###############################################################################
+                # replace to this line
+                result = file.read(scene=scene, plane=plane, roi=roi, 
+                                   zoom=self._current_zoom)
+###############################################################################
+
             # result.shape is (Y, X, 1) or (Y, X, 3) depending on whether it's RGB
             # or grayscale. We want to return (Y, X) or (Y, X, 3).
             return np.squeeze(result)
 
         return array_builder
 
-    def _read_delayed(self) -> xr.DataArray:
-        """
-        The delayed data array constructor for the image.
 
-        Returns
-        -------
-        data: xr.DataArray
-            The fully constructed delayed DataArray.
 
-            It is additionally recommended to closely monitor how dask array chunks are
-            managed.
-        """
-        # 1. Combine the dimension bounds from total_bounding_box (all dimensions) and
-        # scenes_bounding_rectangle (XY only) in order to compute the coordinate array
-        # for each dimension. (Think of the coordinate array as the "ticks" on an axis.)
-        dim_bounds = self._total_bounding_box
-        if len(self._scenes_bounding_rectangle) > 0:
-            assert self._current_scene_index in self._scenes_bounding_rectangle, (
-                f"Expected {self._current_scene_index} to be in "
-                f"{self._scenes_bounding_rectangle}."
-            )
-            rect = self._scenes_bounding_rectangle[self._current_scene_index]
-            dim_bounds[DimensionNames.SpatialX] = (rect.x, rect.x + rect.w)
-            dim_bounds[DimensionNames.SpatialY] = (rect.y, rect.y + rect.h)
-        coords = self._get_coords(self.metadata, self._current_scene_index, dim_bounds)
-
-        # 2. Figure out which dimensions are available on this image, and put them in
-        # TCZYX order as much as possible.
-        ordered_dims = [
-            d
-            for d in DEFAULT_DIMENSION_ORDER_LIST
-            if d in coords or size(self._total_bounding_box, d) > 1
-        ]
-        assert ordered_dims[-2:] == [DimensionNames.SpatialY, DimensionNames.SpatialX]
-        # E.g., non_yx_dims = ['T', 'C', 'Z']
-        non_yx_dims = ordered_dims[:-2]
-
-        # 4. Determine the chunk sizes and number of chunks. Each chunk is a single
-        # YX slice.
-        # E.g., shape = (30, 2, 20, 100, 100)
-        shape = tuple(
-            len(coords[d]) if d in coords else size(self._total_bounding_box, d)
-            for d in ordered_dims
-        )
-        # E.g., shape_without_yx = (30, 2, 20)
-        shape_without_yx = shape[:-2]
-
-        chunk_shape = shape[-2:]
-        if "Bgr" in self._pixel_types[0]:
-            # If the image is BGR, each chunk has shape (X, Y, 3)
-            chunk_shape += (3,)
-            ordered_dims.append(DimensionNames.Samples)
-
-        # 5. Create delayed chunks
-        # The Y and X shape of lazy_arrays are both 1 because we are making each YX
-        # slice a single chunk.
-        # E.g., lazy_arrays.shape = (30, 2, 20, 1, 1)
-        lazy_arrays: np.ndarray = np.ndarray(shape_without_yx + (1, 1), dtype=object)
-        for np_index, _ in np.ndenumerate(lazy_arrays):
-            lazy_arrays[np_index] = da.from_delayed(
-                delayed(self._array_builder(non_yx_dims))(np_index),
-                chunk_shape,
-                dtype=PIXEL_DICT[self._pixel_types[0]],
-            )
-
-        # 6. Package chunks and metadata into a DataArray
-        return xr.DataArray(
-            data=da.block(lazy_arrays.tolist()),
-            dims=ordered_dims,
-            coords=coords,
-            attrs={constants.METADATA_UNPROCESSED: self.metadata},
-        )
-
-    def _read_immediate(self) -> xr.DataArray:
-        """
-        The immediate data array constructor for the image.
-
-        Returns
-        -------
-        data: xr.DataArray
-            The fully read data array.
-        """
-        return self._read_delayed().compute()
 
     def _get_stitched_dask_mosaic(self) -> xr.DataArray:
         """
@@ -413,22 +344,6 @@ class Reader(BaseReader):
         return self._metadata
 
     @property
-    def physical_pixel_sizes(self) -> PhysicalPixelSizes:
-        """
-        Returns
-        -------
-        sizes: PhysicalPixelSizes
-            Using available metadata, the floats representing physical pixel sizes for
-            dimensions Z, Y, and X.
-
-        Notes
-        -----
-        We currently do not handle unit attachment to these values. Please see the file
-        metadata for unit information.
-        """
-        return get_physical_pixel_sizes(self.metadata)
-
-    @property
     def mosaic_tile_dims(self) -> None:
         """
         Returns
@@ -446,6 +361,201 @@ class Reader(BaseReader):
         """
         return None
 
+###############################################################################
+    # added on July 29, 2025
+    # -------------------------------------------------------------------------
+    # Helper Functions
+    # -------------------------------------------------------------------------
+    def _has_scene(self, doc, scene_index: int) -> bool:
+        """Check if a given scene index exists in the CZI file.
+
+        Parameters
+        ----------
+        doc : CziReader
+            Opened CZI document object.
+        scene_index : int
+            Scene index to check.
+
+        Returns
+        -------
+        bool
+            True if the scene exists, False otherwise.
+        """
+        try:
+            _ = doc.scenes_bounding_rectangle[scene_index]
+            return True
+        except (KeyError, AttributeError):
+            return False
+
+
+    # -------------------------------------------------------------------------
+    # Resolution Levels Handling
+    # -------------------------------------------------------------------------
+    @property
+    def resolution_levels(self) -> Tuple[int, ...]:
+        """Return all available resolution levels as a tuple of indices.
+
+        Levels are detected lazily on first access.
+
+        Examples
+        --------
+        >>> reader.resolution_levels
+        (0, 1, 2, 3, 4)
+
+        Returns
+        -------
+        Tuple[int, ...]
+            Available resolution level indices.
+        """
+        if self._resolution_cache is None:
+            self._compute_resolution_levels()
+        return tuple(range(len(self._resolution_cache)))
+
+
+    def _compute_resolution_levels(self, min_zoom: float = 0.01) -> None:
+        """Detect available pyramid resolution levels by probing zoom factors.
+
+        Parameters
+        ----------
+        min_zoom : float, optional
+            Minimum zoom factor to stop searching, by default 0.01.
+        """
+        self._resolution_cache = []
+        zoom, level = 1.0, 0
+
+        with czi.open_czi(self._path) as doc:
+            scene = self._current_scene_index if self._has_scene(doc, self._current_scene_index) else None
+
+            while zoom >= min_zoom:
+                try:
+                    img = doc.read(scene=scene, zoom=zoom)
+                    h, w = img.shape[:2]
+                    ch = 1 if img.ndim == 2 else img.shape[2]
+                    mem_mb = (h * w * ch * img.dtype.itemsize) / (1024 ** 2)
+
+                    self._resolution_cache.append({
+                        "level": level,
+                        "zoom": round(zoom, 4),
+                        "size": (h, w),
+                        "channels": ch,
+                        "estimated_memory_MB": round(mem_mb, 2),
+                    })
+
+                    zoom /= 2
+                    level += 1
+                except Exception:
+                    break
+
+
+    # -------------------------------------------------------------------------
+    # Switch Resolution Level
+    # -------------------------------------------------------------------------
+    def set_resolution_level(self, level: int) -> None:
+        """Set the active resolution level and update internal state.
+
+        Parameters
+        ----------
+        level : int
+            Resolution level index to activate (0 = highest resolution).
+
+        Raises
+        ------
+        IndexError
+            If the requested level is out of range.
+        """
+        if self._resolution_cache is None:
+            self._compute_resolution_levels()
+
+        if level < 0 or level >= len(self._resolution_cache):
+            raise IndexError(f"Invalid level {level}. Available: {self.resolution_levels}")
+
+        info = self._resolution_cache[level]
+        if info["zoom"] == self._current_zoom:
+            return  # Already set to this level
+
+        # Update current zoom & resolution level
+        self._current_zoom = info["zoom"]
+        self._current_resolution_level = level
+        h, w = info["size"]
+
+        # Update bounding box for the selected zoom
+        self._total_bounding_box.update({"X": (0, w), "Y": (0, h)})
+        if self._current_scene_index in self._scenes_bounding_rectangle:
+            rect = self._scenes_bounding_rectangle[self._current_scene_index]
+            self._scenes_bounding_rectangle[self._current_scene_index] = rect.__class__(
+                x=rect.x, y=rect.y, w=w, h=h
+            )
+
+        # Reset cached data arrays to force reload at new resolution
+        self._reset_self()
+
+        print(f"[INFO] Resolution level {level} set: zoom={info['zoom']}, size={info['size']}")
+
+
+    # -------------------------------------------------------------------------
+    # Image Reading
+    # -------------------------------------------------------------------------
+    def _read_delayed(self) -> xr.DataArray:
+        """Build a Dask-backed Xarray DataArray for the current resolution level.
+
+        Lazy loading ensures large images do not overload memory.
+
+        Returns
+        -------
+        xr.DataArray
+            Multi-dimensional array with dims (C, Y, X).
+        """
+        zoom, scene = self._current_zoom, self._current_scene_index
+
+        # Pre-read to determine shape and dtype
+        with czi.open_czi(self._path) as doc:
+            if not self._has_scene(doc, scene):
+                scene = None
+            preview = doc.read(scene=scene, zoom=zoom)
+            y_size, x_size = preview.shape[:2]
+            channels = 1 if preview.ndim == 2 else preview.shape[2]
+            dtype = preview.dtype
+
+        # Define delayed loading function
+        def read_chunk():
+            with czi.open_czi(self._path) as doc2:
+                img = doc2.read(scene=scene, zoom=zoom)
+                return np.transpose(img, (2, 0, 1)) if img.ndim == 3 else img[np.newaxis, ...]
+
+        # Wrap in Dask array
+        arr = da.from_delayed(delayed(read_chunk)(), shape=(channels, y_size, x_size), dtype=dtype)
+
+        # Build Xarray
+        dims, coords = ("C", "Y", "X"), {"C": range(channels), "Y": range(y_size), "X": range(x_size)}
+        return xr.DataArray(arr, dims=dims, coords=coords, attrs={constants.METADATA_UNPROCESSED: self.metadata})
+
+
+    def _read_immediate(self) -> xr.DataArray:
+        """Read full image immediately into memory (blocking)."""
+        return self._read_delayed().compute()
+
+
+    # -------------------------------------------------------------------------
+    # Internal Helpers
+    # -------------------------------------------------------------------------
+    @property
+    def current_resolution_level(self) -> int:
+        """Return the active resolution level index."""
+        return self._current_resolution_level
+
+
+    def _reset_self(self):
+        """Clear cached Xarray objects to force reload at new resolution."""
+        self._xarray_dask_data = None
+        self._xarray_data = None
+
+
+    @property
+    def physical_pixel_sizes(self) -> PhysicalPixelSizes:
+        """Return physical pixel size (currently not implemented)."""
+        return PhysicalPixelSizes(None, None, None)
+###############################################################################
+
 
 def open(filepath: str) -> ContextManager[czi.CziReader]:
     """
@@ -455,3 +565,7 @@ def open(filepath: str) -> ContextManager[czi.CziReader]:
     if filepath.startswith("http") or filepath.startswith("https"):
         return czi.open_czi(filepath, czi.ReaderFileInputTypes.Curl)
     return czi.open_czi(filepath)
+
+
+
+
